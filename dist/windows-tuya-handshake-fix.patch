@@ -1,0 +1,137 @@
+diff --git a/com.homecontrol.lights.ulanziPlugin/plugin/app.js b/com.homecontrol.lights.ulanziPlugin/plugin/app.js
+index 0efcd94..2de71f2 100644
+--- a/com.homecontrol.lights.ulanziPlugin/plugin/app.js
++++ b/com.homecontrol.lights.ulanziPlugin/plugin/app.js
+@@ -459,7 +459,18 @@ async function handleScan(context) {
+     }
+ 
+     manager.sync();
+-    const total = result.wiz.length + result.tuya.length;
++
++    // Bulbs we hold a key for but never heard broadcast (filtered networks, or firmware that
++    // announces on another port): prove identity with a real handshake instead.
++    let located = 0;
++    for (const rec of registry.listDevices()) {
++      if (rec.kind !== 'tuya' || !rec.localKey || rec.ip) continue;
++      const dev = manager.get(rec.id);
++      if (dev && (await manager.rediscover(dev, { force: true }).catch(() => false))) located++;
++    }
++    if (located) manager.sync();
++
++    const total = result.wiz.length + result.tuya.length + located;
+     const removedNote = removed.length ? `, removed ${removed.length} deleted in the Tuya app` : '';
+     $UD.toast(total ? `Found ${total} light(s)${removedNote}` : `No lights found on this network${removedNote}`);
+     sendDevices(context, { scanned: true, interfaces: result.interfaces, tuyaPortCandidates: result.tuyaPortCandidates });
+diff --git a/com.homecontrol.lights.ulanziPlugin/plugin/devices/tuya.js b/com.homecontrol.lights.ulanziPlugin/plugin/devices/tuya.js
+index aa843b0..c35b113 100644
+--- a/com.homecontrol.lights.ulanziPlugin/plugin/devices/tuya.js
++++ b/com.homecontrol.lights.ulanziPlugin/plugin/devices/tuya.js
+@@ -664,32 +664,46 @@ export class TuyaLight {
+  * Last-resort address lookup: try a real local handshake against each candidate host.
+  * Only the right device accepts this id + key pair, so a successful connect identifies it.
+  * Used when a device broadcasts nothing (some networks filter them).
++ *
++ * The protocol version is not part of the cloud's device record, so when it is unknown
++ * every version is tried (a 3.4/3.5 bulb rejects a 3.3 handshake). Resolves to
++ * `{ ip, version }`, or null when no candidate identifies as this device.
+  */
+-export async function findTuyaByHandshake({ devId, localKey, protoVersion = '3.3', candidates = [], timeoutMs = 2500 }) {
+-  for (const ip of candidates) {
+-    const probe = new TuyAPI({ id: devId, key: localKey, ip, version: String(protoVersion) });
+-    probe.on('error', () => {});
+-
+-    // A TCP connect proves nothing — another Tuya bulb happily accepts the socket. Only a
+-    // successful data read proves this key decrypts this device's payloads, i.e. that it
+-    // really is the device we are looking for.
+-    const identified = await Promise.race([
+-      (async () => {
+-        await probe.connect();
+-        const frame = await probe.get({ schema: true });
+-        const dps = frame?.dps || frame;
+-        return Boolean(dps && typeof dps === 'object' && Object.keys(dps).length);
+-      })().catch(() => false),
+-      new Promise((resolve) => setTimeout(() => resolve(false), timeoutMs)),
+-    ]);
++const HANDSHAKE_VERSIONS = ['3.3', '3.4', '3.5', '3.1'];
++
++async function identifyByHandshake({ devId, localKey, ip, version, timeoutMs }) {
++  const probe = new TuyAPI({ id: devId, key: localKey, ip, version: String(version) });
++  probe.on('error', () => {});
++
++  // A TCP connect proves nothing — another Tuya bulb happily accepts the socket. Only a
++  // successful data read proves this key decrypts this device's payloads, i.e. that it
++  // really is the device we are looking for.
++  const identified = await Promise.race([
++    (async () => {
++      await probe.connect();
++      const frame = await probe.get({ schema: true });
++      const dps = frame?.dps || frame;
++      return Boolean(dps && typeof dps === 'object' && Object.keys(dps).length);
++    })().catch(() => false),
++    new Promise((resolve) => setTimeout(() => resolve(false), timeoutMs)),
++  ]);
+ 
+-    // disconnect() is a no-op on a half-open probe (see #destroyDevice) — kill the socket too.
+-    try { probe.removeAllListeners?.(); } catch {}
+-    try { probe.disconnect(); } catch {}
+-    try { clearInterval(probe._pingPongInterval); } catch {}
+-    try { clearTimeout(probe._pingPongTimeout); } catch {}
+-    try { probe.client?.destroy(); } catch {}
+-    if (identified) return ip;
++  // disconnect() is a no-op on a half-open probe (see #destroyDevice) — kill the socket too.
++  try { probe.removeAllListeners?.(); } catch {}
++  try { probe.disconnect(); } catch {}
++  try { clearInterval(probe._pingPongInterval); } catch {}
++  try { clearTimeout(probe._pingPongTimeout); } catch {}
++  try { probe.client?.destroy(); } catch {}
++  return identified;
++}
++
++export async function findTuyaByHandshake({ devId, localKey, protoVersion, candidates = [], timeoutMs = 2500 }) {
++  const known = protoVersion ? String(protoVersion) : null;
++  const versions = known ? [known, ...HANDSHAKE_VERSIONS.filter((v) => v !== known)] : HANDSHAKE_VERSIONS;
++  for (const ip of candidates) {
++    for (const version of versions) {
++      if (await identifyByHandshake({ devId, localKey, ip, version, timeoutMs })) return { ip, version };
++    }
+   }
+   return null;
+ }
+diff --git a/com.homecontrol.lights.ulanziPlugin/plugin/state.js b/com.homecontrol.lights.ulanziPlugin/plugin/state.js
+index 02fd1c2..8a40da1 100644
+--- a/com.homecontrol.lights.ulanziPlugin/plugin/state.js
++++ b/com.homecontrol.lights.ulanziPlugin/plugin/state.js
+@@ -182,7 +182,7 @@ export class DeviceManager {
+    * Look it up again by MAC (WiZ) or device id (Tuya) and update the registry, so the
+    * user never has to press "Scan network" a second time. Rate-limited per device.
+    */
+-  async rediscover(dev) {
++  async rediscover(dev, { force = false } = {}) {
+     const record = dev?.record;
+     if (!record) return false;
+ 
+@@ -190,7 +190,7 @@ export class DeviceManager {
+     const pending = this.rediscovery.get(dev.id);
+     if (pending) {
+       if (pending.promise) return pending.promise;
+-      if (Date.now() - pending.at < cooldown) return false;
++      if (!force && Date.now() - pending.at < cooldown) return false;
+     }
+ 
+     const promise = (async () => {
+@@ -209,13 +209,13 @@ export class DeviceManager {
+             registry.listDevices().filter((d) => d.id !== record.id && d.ip).map((d) => d.ip)
+           );
+           const candidates = (await probeTuyaPorts({})).filter((ip) => !taken.has(ip));
+-          const ip = await findTuyaByHandshake({
++          const hit = await findTuyaByHandshake({
+             devId: record.devId,
+             localKey: record.localKey,
+             protoVersion: record.protoVersion,
+             candidates,
+           });
+-          if (ip) found = { ip, version: record.protoVersion };
++          if (hit) found = { ip: hit.ip, version: hit.version };
+         }
+         if (!found) return false;
+ 
